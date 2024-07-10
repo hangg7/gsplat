@@ -1,4 +1,5 @@
 import math
+import pdb
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -7,15 +8,13 @@ from typing_extensions import Literal
 
 from .cuda._wrapper import (
     fully_fused_projection,
+    fully_fused_projection_2dgs,
     isect_offset_encode,
     isect_tiles,
     rasterize_to_pixels,
-    spherical_harmonics,
-    fully_fused_projection_2dgs,
     rasterize_to_pixels_2dgs,
+    spherical_harmonics,
 )
-import pdb
-
 from .utils import depth_to_normal
 
 
@@ -109,7 +108,7 @@ def rasterization(
         `meta["means2d"].absgrad`. This is an implementation of the paper
         `AbsGS: Recovering Fine Details for 3D Gaussian Splatting <https://arxiv.org/abs/2404.10484>`_,
         which is shown to be more effective for splitting Gaussians during training.
-            
+
     .. warning::
         This function is currently not differentiable w.r.t. the camera intrinsics `Ks`.
 
@@ -199,7 +198,7 @@ def rasterization(
     assert viewmats.shape == (C, 4, 4), viewmats.shape
     assert Ks.shape == (C, 3, 3), Ks.shape
     assert render_mode in ["RGB", "D", "ED", "RGB+D", "RGB+ED"], render_mode
-  
+
     if sh_degree is None:
         # treat colors as post-activation values
         # colors should be in shape [N, D] or (C, N, D) (silently support)
@@ -303,7 +302,7 @@ def rasterization(
     elif render_mode in ["D", "ED"]:
         colors = depths[..., None]
         if backgrounds is not None:
-            backgrounds =  torch.zeros(C, 1, device=backgrounds.device)
+            backgrounds = torch.zeros(C, 1, device=backgrounds.device)
     else:  # RGB
         pass
     render_colors, render_alphas = rasterize_to_pixels(
@@ -329,7 +328,7 @@ def rasterization(
             ],
             dim=-1,
         )
-    
+
     meta = {
         "camera_ids": camera_ids,
         "gaussian_ids": gaussian_ids,
@@ -705,8 +704,14 @@ def rasterization_2dgs(
     # Rasterize to pixels
     if render_mode in ["RGB+D", "RGB+ED"]:
         colors = torch.cat((colors, depths[..., None]), dim=-1)
+        if backgrounds is not None:
+            backgrounds = torch.cat(
+                [backgrounds, torch.zeros(C, 1, device=backgrounds.device)], dim=-1
+            )
     elif render_mode in ["D", "ED"]:
         colors = depths[..., None]
+        if backgrounds is not None:
+            backgrounds = torch.zeros(C, 1, device=backgrounds.device)
     else:  # RGB
         pass
     densifications = (
@@ -715,22 +720,24 @@ def rasterization_2dgs(
         )
         + 0
     )
-    render_colors, render_alphas, render_normals, render_distloss = rasterize_to_pixels_2dgs(
-        means2d,
-        densifications,
-        ray_transformations,
-        colors,
-        opacities,
-        normals,
-        width,
-        height,
-        tile_size,
-        isect_offsets,
-        flatten_ids,
-        backgrounds=backgrounds,
-        packed=packed,
-        absgrad=absgrad,
-        distloss=distloss,
+    render_colors, render_alphas, render_normals, render_distloss = (
+        rasterize_to_pixels_2dgs(
+            means2d,
+            densifications,
+            ray_transformations,
+            colors,
+            opacities,
+            normals,
+            width,
+            height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+            backgrounds=backgrounds,
+            packed=packed,
+            absgrad=absgrad,
+            distloss=distloss,
+        )
     )
     render_normals_from_depth = None
     if render_mode in ["ED", "RGB+ED"]:
@@ -741,15 +748,11 @@ def rasterization_2dgs(
                 render_colors[..., -1:] / render_alphas.clamp(min=1e-10),
             ],
             dim=-1,
-        )  
+        )
     if render_mode in ["RGB+ED", "RGB+D"]:
         render_depths = render_colors[..., -1:]
         render_normals_from_depth = depth_to_normal(
-            render_depths,
-            torch.linalg.inv(viewmats), # c2w 
-            Ks, 
-            near_plane,
-            far_plane
+            render_depths, torch.linalg.inv(viewmats), Ks, near_plane, far_plane  # c2w
         ).squeeze(0)
 
         # render_normals_from_depth = depth_to_normal(
@@ -759,7 +762,7 @@ def rasterization_2dgs(
         #     height,
         #     render_depths,
         # )
-    
+
     meta = {
         "camera_ids": camera_ids,
         "gaussian_ids": gaussian_ids,
@@ -780,9 +783,14 @@ def rasterization_2dgs(
         "tile_size": tile_size,
         "render_distloss": render_distloss,
     }
-    
+
     # import pdb
     # pdb.set_trace()
     render_normals = render_normals @ torch.linalg.inv(viewmats)[0, :3, :3].T
-    
-    return (render_colors, render_alphas, render_normals, render_normals_from_depth), meta
+
+    return (
+        render_colors,
+        render_alphas,
+        render_normals,
+        render_normals_from_depth,
+    ), meta

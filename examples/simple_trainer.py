@@ -3,22 +3,24 @@ import math
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Literal
+from typing import Dict, List, Literal, Optional, Tuple
 
 import imageio
+import nerfview
 import numpy as np
 import torch
 import torch.nn.functional as F
 import tqdm
 import tyro
 import viser
-import nerfview
-from datasets.colmap import Dataset, Parser
-from datasets.traj import generate_interpolated_path
+from gsplat.rendering import rasterization, rasterization_2dgs
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
+from datasets.colmap import Dataset, Parser
+from datasets.traj import generate_interpolated_path
 from utils import (
     AppearanceOptModule,
     CameraOptModule,
@@ -27,8 +29,6 @@ from utils import (
     rgb_to_sh,
     set_random_seed,
 )
-
-from gsplat.rendering import rasterization, rasterization_2dgs
 
 
 @dataclass
@@ -134,7 +134,7 @@ class Config:
     depth_loss: bool = False
     # Weight for depth loss
     depth_lambda: float = 1e-2
-    
+
     # Enable normal consistency loss. (Currently for 2DGS only)
     normal_loss: bool = False
     # Weight for normal loss
@@ -362,12 +362,12 @@ class Runner:
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
 
         rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
-        
+
         if self.model_type == "3dgs":
             rasterize_fnc = rasterization
         elif self.model_type == "2dgs":
             rasterize_fnc = rasterization_2dgs
-            
+
         # render_colors, render_alphas, info = rasterization(
         #     means=means,
         #     quats=quats,
@@ -400,15 +400,26 @@ class Runner:
             rasterize_mode=rasterize_mode,
             **kwargs,
         )
-        
+
         if len(results) == 4:
-            render_colors, render_alphas, render_normals, render_normals_from_depth = results
-        else: 
+            (
+                render_colors,
+                render_alphas,
+                render_normals,
+                render_normals_from_depth,
+            ) = results
+        else:
             render_colors, render_alphas = results
             render_normals = None
             render_normals_from_depth = None
-         
-        return render_colors, render_alphas, render_normals, render_normals_from_depth, info
+
+        return (
+            render_colors,
+            render_alphas,
+            render_normals,
+            render_normals_from_depth,
+            info,
+        )
 
     def train(self):
         cfg = self.cfg
@@ -484,7 +495,13 @@ class Runner:
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
             # forward
-            renders, alphas, render_normals, render_normals_from_depth, info = self.rasterize_splats(
+            (
+                renders,
+                alphas,
+                render_normals,
+                render_normals_from_depth,
+                info,
+            ) = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -532,13 +549,15 @@ class Runner:
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
-            
+
             if cfg.normal_loss:
                 # normal consistency loss
                 render_normals = render_normals.squeeze(0).permute((2, 0, 1))
                 render_normals_from_depth *= alphas.squeeze(0).detach()
                 render_normals_from_depth = render_normals_from_depth.permute((2, 0, 1))
-                normal_error = (1 - (render_normals * render_normals_from_depth).sum(dim=0))[None]
+                normal_error = (
+                    1 - (render_normals * render_normals_from_depth).sum(dim=0)
+                )[None]
                 normal_loss = cfg.normal_lambda * normal_error.mean()
                 loss += normal_loss
 
@@ -546,9 +565,8 @@ class Runner:
                 distloss = info["render_distloss"].mean()
                 loss += distloss * cfg.dist_lambda
 
-
             loss.backward()
-            
+
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
@@ -876,7 +894,13 @@ class Runner:
 
             torch.cuda.synchronize()
             tic = time.time()
-            colors, alphas, render_normals, render_normals_from_depth, info = self.rasterize_splats(
+            (
+                colors,
+                alphas,
+                render_normals,
+                render_normals_from_depth,
+                info,
+            ) = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -896,32 +920,45 @@ class Runner:
             imageio.imwrite(
                 f"{self.render_dir}/val_{i:04d}.png", (canvas * 255).astype(np.uint8)
             )
-            
+
             # write normals
             render_normals = (render_normals * 0.5 + 0.5).squeeze(0).cpu().numpy()
             normals_output = (render_normals * 255).astype(np.uint8)
             imageio.imwrite(
                 f"{self.render_dir}/val_{i:04d}_normal_{step}.png", normals_output
             )
-            
+
             # write normals from depth
             render_normals_from_depth *= alphas.squeeze(0).detach()
-            render_normals_from_depth = (render_normals_from_depth * 0.5 + 0.5).cpu().numpy()
-            render_normals_from_depth = (render_normals_from_depth - np.min(render_normals_from_depth)) / (np.max(render_normals_from_depth) - np.min(render_normals_from_depth))
-            normals_from_depth_output = (render_normals_from_depth * 255).astype(np.uint8)
+            render_normals_from_depth = (
+                (render_normals_from_depth * 0.5 + 0.5).cpu().numpy()
+            )
+            render_normals_from_depth = (
+                render_normals_from_depth - np.min(render_normals_from_depth)
+            ) / (np.max(render_normals_from_depth) - np.min(render_normals_from_depth))
+            normals_from_depth_output = (render_normals_from_depth * 255).astype(
+                np.uint8
+            )
             imageio.imwrite(
-                f"{self.render_dir}/val_{i:04d}_normals_from_depth_{step}.png", normals_from_depth_output
+                f"{self.render_dir}/val_{i:04d}_normals_from_depth_{step}.png",
+                normals_from_depth_output,
             )
 
             # write distortions
             from utils import colormap
+
             render_dist = info["render_distloss"]
             dist_max = torch.max(render_dist)
             dist_min = torch.min(render_dist)
             render_dist = (render_dist - dist_min) / (dist_max - dist_min)
             # import pdb
             # pdb.set_trace()
-            render_dist = colormap(render_dist.cpu().numpy()[0]).permute((1, 2, 0)).numpy().astype(np.uint8)
+            render_dist = (
+                colormap(render_dist.cpu().numpy()[0])
+                .permute((1, 2, 0))
+                .numpy()
+                .astype(np.uint8)
+            )
             imageio.imwrite(
                 f"{self.render_dir}/val_{i:04d}_distortions_{step}.png", render_dist
             )

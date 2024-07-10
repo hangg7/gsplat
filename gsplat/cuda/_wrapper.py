@@ -1,9 +1,8 @@
+import pdb
 from typing import Callable, Optional, Tuple
 
 import torch
 from torch import Tensor
-
-import pdb
 
 
 def _make_lazy_cuda_func(name: str) -> Callable:
@@ -1468,7 +1467,12 @@ def rasterize_to_pixels_2dgs(
 
     # densifications = torch.zeros_like(means2d)
     # pdb.set_trace()
-    render_colors, render_alphas, render_normals, render_distloss = _RasterizeToPixels2DGS.apply(
+    (
+        render_colors,
+        render_alphas,
+        render_normals,
+        render_distloss,
+    ) = _RasterizeToPixels2DGS.apply(
         means2d.contiguous(),
         ray_transformations.contiguous(),
         colors.contiguous(),
@@ -1560,9 +1564,13 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
         absgrad: bool,
         distloss: bool,
     ) -> Tuple[Tensor, Tensor]:
-        render_colors, render_alphas, render_normals, render_distloss, last_ids = _make_lazy_cuda_func(
-            "rasterize_to_pixels_fwd_2dgs"
-        )(
+        (
+            render_colors,
+            render_alphas,
+            render_normals,
+            render_distloss,
+            last_ids,
+        ) = _make_lazy_cuda_func("rasterize_to_pixels_fwd_2dgs")(
             means2d,
             colors,
             ray_transformations,
@@ -1596,7 +1604,6 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
         ctx.absgrad = absgrad
         ctx.distloss = distloss
 
-        
         # doubel to float
         render_alphas = render_alphas.float()
         return render_colors, render_alphas, render_normals, render_distloss
@@ -1628,11 +1635,12 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
         tile_size = ctx.tile_size
         absgrad = ctx.absgrad
         distloss = ctx.distloss
-        if distloss: 
+        if distloss:
             assert v_render_distloss is not None, "v_render_distloss should bot be None"
             v_render_distloss = v_render_distloss.contiguous()
         else:
-            assert v_render_distloss is None, "v_render_distloss should be None"
+            #  assert v_render_distloss is None, "v_render_distloss should be None"
+            pass
 
         (
             v_means2d_abs,
